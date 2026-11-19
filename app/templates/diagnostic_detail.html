@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+{% block content %}
+{% set sheet = data.sheet %}
+{% set latest = data.history[-1] %}
+<section>
+  <h2>诊断单 #{{ sheet.id }}：设备 {{ sheet.device_id }} / 固件 <span class="mono">{{ sheet.fw_version }}</span></h2>
+  <p>
+    <a href="{{ url_for('main.diagnostics') }}">返回诊断单列表</a> ·
+    <a href="{{ url_for('main.device', device_id=sheet.device_id) }}">设备帧页</a> ·
+    <a href="{{ url_for('main.api_diagnostic_detail', sheet_id=sheet.id) }}">JSON</a>
+  </p>
+
+  <h2 style="margin-top:1rem">当前结论</h2>
+  <p>
+    <span class="badge {{ latest.conclusion }}" style="font-size:.95rem">
+      {{ latest.conclusion | conclusion_label }}
+    </span>
+    <span class="muted">（结论 #{{ latest.id }}，{{ latest.created_at }}）</span>
+  </p>
+
+  {% if latest.conclusion == 'stuck_bit' %}
+  <p>
+    卡位位置：第 <strong>{{ latest.detail.bit_position }}</strong> 位
+    （掩码 <span class="mono">{{ latest.detail.bit_mask }}</span>，位 31 为最高位），
+    方向：固定为 <strong>{{ latest.detail.stuck_value }}</strong>。
+  </p>
+  {% elif latest.conclusion == 'word_order_suspect' %}
+  <p>
+    已登记字序 <span class="mono">{{ latest.detail.registered_order }}</span>
+    下无一吻合；换用相反字序
+    <span class="mono">{{ latest.detail.opposite_order }}</span>
+    后全部样本吻合，字序嫌疑。字序与原帧均未改动。
+  </p>
+  {% elif latest.conclusion == 'inconclusive' %}
+  <p>
+    相反字序 <span class="mono">{{ latest.detail.word_order.opposite_order }}</span>
+    可解释全部样本，同时第 {{ latest.detail.stuck_bit.bit_position }} 位
+    （掩码 <span class="mono">{{ latest.detail.stuck_bit.bit_mask }}</span>）
+    固定为 {{ latest.detail.stuck_bit.stuck_value }} 也可解释全部样本，两种解释无法区分。
+  </p>
+  {% elif latest.conclusion == 'normal' %}
+  <p>原帧按已登记字序重组后与预期位型全部吻合，状态正常。</p>
+  {% elif latest.conclusion == 'unexplainable' %}
+  <p>相反字序与任何单位卡位都无法解释全部样本，无法解释。</p>
+  {% elif latest.conclusion == 'pending' %}
+  <p class="muted">
+    待补原因：
+    {% for r in latest.detail.pending_reasons %}
+      帧 {{ r.frame_no }}（{{ r.reason | pending_reason_label }}）{% if not loop.last %}；{% endif %}
+    {% endfor %}
+    补传缺帧或登记固件后将自动重评，旧结论与证据保留在下方历史中。
+  </p>
+  {% endif %}
+</section>
+
+<section>
+  <h2>证据快照（与结论 #{{ latest.id }} 同一已提交状态）</h2>
+  <table>
+    <thead>
+      <tr><th>帧号</th><th>预期位型</th><th>原始字</th><th>已登记字序重组</th>
+          <th>相反字序重组</th><th>状态</th></tr>
+    </thead>
+    <tbody>
+    {% for e in latest.evidence %}
+      <tr>
+        <td>{{ e.frame_no }}</td>
+        <td class="mono">{{ e.expected_pattern }}</td>
+        <td class="mono">{{ e.raw_word or '—' }}</td>
+        <td class="mono">{{ e.assembled_pattern or '—' }}</td>
+        <td class="mono">{{ e.swapped_pattern or '—' }}</td>
+        <td>
+          {% if e.status == 'comparable' %}
+            <span class="muted">已比对</span>
+          {% else %}
+            <span class="badge pending">{{ e.status | pending_reason_label }}</span>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h2>历史结论（每次重评追加，旧证据保留）</h2>
+  <table>
+    <thead><tr><th>结论序号</th><th>结论</th><th>时间</th></tr></thead>
+    <tbody>
+    {% for c in data.history %}
+      <tr>
+        <td>#{{ c.id }}</td>
+        <td><span class="badge {{ c.conclusion }}">{{ c.conclusion | conclusion_label }}</span></td>
+        <td class="muted">{{ c.created_at }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+{% endblock %}

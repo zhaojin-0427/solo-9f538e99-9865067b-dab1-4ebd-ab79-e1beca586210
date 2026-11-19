@@ -11,7 +11,7 @@ from flask import (
     url_for,
 )
 
-from . import db, decoder, service
+from . import db, decoder, diagnosis, service
 
 bp = Blueprint("main", __name__)
 
@@ -26,6 +26,16 @@ STATUS_LABELS = {
 @bp.app_template_filter("status_label")
 def status_label(status):
     return STATUS_LABELS.get(status, status)
+
+
+@bp.app_template_filter("conclusion_label")
+def conclusion_label(code):
+    return diagnosis.CONCLUSION_LABELS.get(code, code)
+
+
+@bp.app_template_filter("pending_reason_label")
+def pending_reason_label(code):
+    return diagnosis.PENDING_REASON_LABELS.get(code, code)
 
 
 @bp.app_template_filter("reading_fmt")
@@ -192,6 +202,83 @@ def device(device_id):
     )
 
 
+# --- Diagnostic sheets ----------------------------------------------------
+
+
+def _sheet_params_from(payload):
+    """Pull (device_id, fw_version, entries text) from form or JSON payload."""
+    if not payload:
+        raise diagnosis.SheetValidationError("请求内容为空")
+    device_id = (payload.get("device_id") or "").strip()
+    fw_version = (payload.get("fw_version") or "").strip()
+    entries_text = payload.get("entries_text")
+    if entries_text is None:
+        entries = payload.get("entries")
+        if isinstance(entries, list):
+            entries_text = "\n".join(
+                "%s,%s"
+                % (item.get("frame_no", ""), item.get("expected_pattern", ""))
+                for item in entries
+            )
+        else:
+            entries_text = ""
+    if hasattr(entries_text, "read"):
+        entries_text = entries_text.read()
+    if isinstance(entries_text, bytes):
+        entries_text = entries_text.decode("utf-8", errors="replace")
+    elif not isinstance(entries_text, str):
+        raise diagnosis.SheetValidationError("entries_text 必须是文本")
+    return device_id, fw_version, entries_text.splitlines()
+
+
+def _create_sheet(payload):
+    device_id, fw_version, lines = _sheet_params_from(payload)
+    device_id, fw_version, entries = diagnosis.parse_sheet_input(
+        device_id, fw_version, lines
+    )
+    return service.create_diagnostic_sheet(db.get_db(), device_id, fw_version, entries)
+
+
+@bp.get("/diagnostics")
+def diagnostics():
+    conn = db.get_db()
+    with db.read_snapshot(conn):
+        sheets = service.list_diagnostic_sheets(conn)
+    return render_template(
+        "diagnostics.html",
+        sheets=sheets,
+        min_entries=diagnosis.MIN_ENTRIES,
+        max_entries=diagnosis.MAX_ENTRIES,
+        min_distinct=diagnosis.MIN_DISTINCT_PATTERNS,
+    )
+
+
+@bp.post("/diagnostics")
+def create_diagnostic():
+    try:
+        result = _create_sheet(request.form)
+    except diagnosis.SheetValidationError as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("main.diagnostics"))
+    sheet = result["sheet"]
+    flash(
+        "诊断单 #%d 已建立，当前结论：%s。"
+        % (sheet["id"], diagnosis.CONCLUSION_LABELS[result["conclusion"]["conclusion"]]),
+        "success",
+    )
+    return redirect(url_for("main.diagnostic_detail", sheet_id=sheet["id"]))
+
+
+@bp.get("/diagnostics/<int:sheet_id>")
+def diagnostic_detail(sheet_id):
+    conn = db.get_db()
+    with db.read_snapshot(conn):
+        data = service.get_diagnostic_sheet(conn, sheet_id)
+    if data is None:
+        abort(404)
+    return render_template("diagnostic_detail.html", data=data)
+
+
 # --- JSON API -------------------------------------------------------------
 
 
@@ -267,3 +354,32 @@ def api_upload():
             "frames": stored,
         }
     )
+
+
+@bp.get("/api/diagnostics")
+def api_diagnostics():
+    conn = db.get_db()
+    with db.read_snapshot(conn):
+        return jsonify({"sheets": service.list_diagnostic_sheets(conn)})
+
+
+@bp.post("/api/diagnostics")
+def api_create_diagnostic():
+    payload = request.get_json(silent=True)
+    if payload is None:
+        payload = request.form
+    try:
+        result = _create_sheet(payload)
+    except diagnosis.SheetValidationError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify(result), 201
+
+
+@bp.get("/api/diagnostics/<int:sheet_id>")
+def api_diagnostic_detail(sheet_id):
+    conn = db.get_db()
+    with db.read_snapshot(conn):
+        data = service.get_diagnostic_sheet(conn, sheet_id)
+    if data is None:
+        abort(404)
+    return jsonify(data)

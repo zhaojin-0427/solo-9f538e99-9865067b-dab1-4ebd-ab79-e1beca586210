@@ -1,8 +1,9 @@
 """Transactional business logic for uploads and firmware registration."""
 
+import json
 from contextlib import contextmanager
 
-from . import decoder
+from . import decoder, diagnosis
 
 
 class ConflictError(Exception):
@@ -98,6 +99,7 @@ def ingest(db, rows):
             )
 
         inserted_in_batch = set()
+        affected = set()  # (device_id, fw_version) with newly stored frames
         for row in rows:
             key = (row["device_id"], row["frame_no"])
             prev = existing.get(key)
@@ -137,8 +139,16 @@ def ingest(db, rows):
                 ),
             )
             inserted_in_batch.add(key)
+            affected.add((row["device_id"], fw))
             summary["inserted"] += 1
             summary["inserted_keys"].append(key)
+
+        # Re-evaluate the diagnostic sheets touched by this batch in the same
+        # transaction, so any new conclusion commits atomically with the frames
+        # it is based on.  Batches that only retransmit (no inserts) change no
+        # frame state and therefore produce no new conclusions.
+        for device_id, fw_version in affected:
+            _reevaluate_sheets(db, device_id=device_id, fw_version=fw_version)
 
     return summary
 
@@ -200,6 +210,11 @@ def register_firmware(db, fw_version, word_order):
                     decoded += 1
                 else:
                     invalid += 1
+
+        # Re-evaluate every sheet for this firmware in the same transaction as
+        # the registration/backfill: a sheet must never read "registered
+        # firmware" while its evidence still shows a pending firmware.
+        _reevaluate_sheets(db, fw_version=fw_version)
 
     return {
         "fw_version": fw_version,
@@ -270,3 +285,223 @@ def batch_frames(db, rows):
         if stored is not None:
             result.append(dict(stored))
     return result
+
+
+# --- Diagnostic sheets ----------------------------------------------------
+
+
+def _registered_order(db, fw_version):
+    row = db.execute(
+        "SELECT word_order FROM firmware WHERE fw_version = ?", (fw_version,)
+    ).fetchone()
+    return row["word_order"] if row is not None else None
+
+
+def _frame_lookup(db, device_id, frame_nos):
+    """Stored raw frames for a sheet's frame numbers (one snapshot)."""
+    if not frame_nos:
+        return {}
+    placeholders = ",".join("?" for _ in frame_nos)
+    rows = db.execute(
+        """SELECT frame_no, raw_word, fw_version FROM frames
+           WHERE device_id = ? AND frame_no IN (%s)""" % placeholders,
+        [device_id, *frame_nos],
+    ).fetchall()
+    return {
+        r["frame_no"]: {"raw_word": r["raw_word"], "fw_version": r["fw_version"]}
+        for r in rows
+    }
+
+
+def _store_conclusion(db, sheet_id, result):
+    """Append a conclusion row only when the conclusion actually changed.
+
+    Evidence/detail are stored on the same row as the code, so a reader can
+    never observe a conclusion whose samples come from a different state.
+    Returns ``(appended, conclusion_row)``.
+    """
+    latest = db.execute(
+        """SELECT conclusion, detail_json, evidence_json
+           FROM diagnostic_conclusions WHERE sheet_id = ?
+           ORDER BY id DESC LIMIT 1""",
+        (sheet_id,),
+    ).fetchone()
+    detail_text = (
+        diagnosis.canonical_json(result["detail"])
+        if result["detail"] is not None
+        else None
+    )
+    evidence_text = diagnosis.canonical_json(result["evidence"])
+    if (
+        latest is not None
+        and latest["conclusion"] == result["code"]
+        and (latest["detail_json"] or None) == (detail_text or None)
+        and latest["evidence_json"] == evidence_text
+    ):
+        return False, latest
+
+    cur = db.execute(
+        """INSERT INTO diagnostic_conclusions
+               (sheet_id, conclusion, detail_json, evidence_json)
+           VALUES (?, ?, ?, ?)""",
+        (sheet_id, result["code"], detail_text, evidence_text),
+    )
+    return True, db.execute(
+        """SELECT id, conclusion, detail_json, evidence_json, created_at
+           FROM diagnostic_conclusions WHERE id = ?""",
+        (cur.lastrowid,),
+    ).fetchone()
+
+
+def _evaluate_sheet(db, sheet):
+    entries = json.loads(sheet["entries_json"])
+    order = _registered_order(db, sheet["fw_version"])
+    lookup = _frame_lookup(db, sheet["device_id"], [e["frame_no"] for e in entries])
+    return diagnosis.evaluate(
+        sheet["fw_version"], entries, lookup, order
+    )
+
+
+def _reevaluate_sheets(db, device_id=None, fw_version=None):
+    """Re-evaluate sheets affected by a committed frame/firmware change.
+
+    Must be called inside a ``write_transaction``.  Sheets whose current
+    conclusion is already terminal (not ``pending``) cannot change -- frames
+    and word order are immutable -- so they are skipped.  Irrelevant uploads
+    never reach this function and therefore never create a conclusion.
+    """
+    sql = (
+        "SELECT id, device_id, fw_version, entries_json FROM diagnostic_sheets"
+    )
+    clauses, params = [], []
+    if fw_version is not None:
+        clauses.append("fw_version = ?")
+        params.append(fw_version)
+    if device_id is not None:
+        clauses.append("device_id = ?")
+        params.append(device_id)
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY id"
+
+    reevaluated = 0
+    appended = 0
+    for sheet in db.execute(sql, params).fetchall():
+        latest = db.execute(
+            """SELECT conclusion FROM diagnostic_conclusions
+               WHERE sheet_id = ? ORDER BY id DESC LIMIT 1""",
+            (sheet["id"],),
+        ).fetchone()
+        if latest is not None and latest["conclusion"] != "pending":
+            continue
+        result = _evaluate_sheet(db, sheet)
+        did_append, _row = _store_conclusion(db, sheet["id"], result)
+        reevaluated += 1
+        if did_append:
+            appended += 1
+    return {"reevaluated": reevaluated, "appended": appended}
+
+
+def create_diagnostic_sheet(db, device_id, fw_version, entries):
+    """Store a validated sheet and evaluate it once, atomically."""
+    with write_transaction(db):
+        cur = db.execute(
+            """INSERT INTO diagnostic_sheets (device_id, fw_version, entries_json)
+               VALUES (?, ?, ?)""",
+            (
+                device_id,
+                fw_version,
+                diagnosis.canonical_json(entries),
+            ),
+        )
+        sheet_id = cur.lastrowid
+        sheet = db.execute(
+            "SELECT id, device_id, fw_version, entries_json, created_at"
+            " FROM diagnostic_sheets WHERE id = ?",
+            (sheet_id,),
+        ).fetchone()
+        result = _evaluate_sheet(db, sheet)
+        _appended, row = _store_conclusion(db, sheet_id, result)
+
+    return {
+        "sheet": {
+            "id": sheet["id"],
+            "device_id": sheet["device_id"],
+            "fw_version": sheet["fw_version"],
+            "entries": json.loads(sheet["entries_json"]),
+            "created_at": sheet["created_at"],
+        },
+        "conclusion": _conclusion_to_dict(row),
+    }
+
+
+def _conclusion_to_dict(row):
+    return {
+        "id": row["id"],
+        "conclusion": row["conclusion"],
+        "detail": json.loads(row["detail_json"]) if row["detail_json"] else None,
+        "evidence": json.loads(row["evidence_json"]),
+        "created_at": row["created_at"],
+    }
+
+
+def list_diagnostic_sheets(db):
+    """Sheets with their latest conclusion, read in one snapshot."""
+    rows = db.execute(
+        """SELECT s.id, s.device_id, s.fw_version, s.entries_json, s.created_at,
+                  c.id AS conclusion_id, c.conclusion, c.detail_json,
+                  c.evidence_json, c.created_at AS concluded_at
+           FROM diagnostic_sheets s
+           LEFT JOIN diagnostic_conclusions c
+             ON c.id = (SELECT MAX(id) FROM diagnostic_conclusions
+                        WHERE sheet_id = s.id)
+           ORDER BY s.id"""
+    ).fetchall()
+    result = []
+    for r in rows:
+        item = {
+            "id": r["id"],
+            "device_id": r["device_id"],
+            "fw_version": r["fw_version"],
+            "entries": json.loads(r["entries_json"]),
+            "created_at": r["created_at"],
+        }
+        if r["conclusion_id"] is not None:
+            item["latest"] = {
+                "id": r["conclusion_id"],
+                "conclusion": r["conclusion"],
+                "detail": json.loads(r["detail_json"])
+                if r["detail_json"]
+                else None,
+                "evidence": json.loads(r["evidence_json"]),
+                "created_at": r["concluded_at"],
+            }
+        else:
+            item["latest"] = None
+        result.append(item)
+    return result
+
+
+def get_diagnostic_sheet(db, sheet_id):
+    sheet = db.execute(
+        "SELECT id, device_id, fw_version, entries_json, created_at"
+        " FROM diagnostic_sheets WHERE id = ?",
+        (sheet_id,),
+    ).fetchone()
+    if sheet is None:
+        return None
+    rows = db.execute(
+        """SELECT id, conclusion, detail_json, evidence_json, created_at
+           FROM diagnostic_conclusions WHERE sheet_id = ? ORDER BY id""",
+        (sheet_id,),
+    ).fetchall()
+    return {
+        "sheet": {
+            "id": sheet["id"],
+            "device_id": sheet["device_id"],
+            "fw_version": sheet["fw_version"],
+            "entries": json.loads(sheet["entries_json"]),
+            "created_at": sheet["created_at"],
+        },
+        "history": [_conclusion_to_dict(r) for r in rows],
+    }

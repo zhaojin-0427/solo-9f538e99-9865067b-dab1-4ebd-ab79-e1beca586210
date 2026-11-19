@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section>
+  <h2>新建网页诊断单</h2>
+  <p class="muted">
+    录入同设备、同固件的 {{ min_entries }}～{{ max_entries }} 个帧号及各自预期的 8 位十六进制
+    IEEE 754 单精度位型，预期位型须至少 {{ min_distinct }} 种；每行格式
+    <span class="mono">帧号,预期位型</span>（如 <span class="mono">1001,3F800000</span>）。
+    诊断只按已登记字序重组原帧后比对，不会修改原帧或字序。
+  </p>
+  <form method="post" action="{{ url_for('main.create_diagnostic') }}">
+    <p>
+      <input type="text" name="device_id" placeholder="设备号" required
+             style="width:12rem">
+      <input type="text" name="fw_version" placeholder="固件号" required
+             style="width:12rem">
+    </p>
+    <p><textarea name="entries_text" placeholder="1001,3F800000&#10;1002,40000000" required></textarea></p>
+    <button type="submit">建立并诊断</button>
+  </form>
+</section>
+
+<section>
+  <h2>诊断单列表</h2>
+  {% if sheets %}
+  <table>
+    <thead>
+      <tr><th>#</th><th>设备号</th><th>固件号</th><th>帧数</th><th>当前结论</th>
+          <th>结论时间</th><th>创建时间</th></tr>
+    </thead>
+    <tbody>
+    {% for s in sheets %}
+      <tr>
+        <td><a href="{{ url_for('main.diagnostic_detail', sheet_id=s.id) }}">{{ s.id }}</a></td>
+        <td>{{ s.device_id }}</td>
+        <td class="mono">{{ s.fw_version }}</td>
+        <td>{{ s.entries | length }}</td>
+        <td>
+          {% if s.latest %}
+            <span class="badge {{ s.latest.conclusion }}">
+              {{ s.latest.conclusion | conclusion_label }}
+            </span>
+          {% else %}
+            <span class="muted">—</span>
+          {% endif %}
+        </td>
+        <td class="muted">{{ s.latest.created_at if s.latest else '—' }}</td>
+        <td class="muted">{{ s.created_at }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">尚无诊断单。</p>
+  {% endif %}
+</section>
+
+{% endblock %}

@@ -31,6 +31,38 @@ CREATE TABLE IF NOT EXISTS frames (
 
 CREATE INDEX IF NOT EXISTS idx_frames_fw_status ON frames (fw_version, status);
 CREATE INDEX IF NOT EXISTS idx_frames_device ON frames (device_id, frame_no);
+
+CREATE TABLE IF NOT EXISTS diagnostic_sheets (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id     TEXT NOT NULL,
+    fw_version    TEXT NOT NULL,
+    entries_json  TEXT NOT NULL,
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_sheets_device ON diagnostic_sheets (device_id);
+CREATE INDEX IF NOT EXISTS idx_sheets_fw ON diagnostic_sheets (fw_version);
+
+-- One row per evaluation.  A sheet that is still missing data accumulates
+-- fresh "pending" rows on every relevant re-evaluation; sheets that become
+-- normal/suspect/stuck stop changing and no more rows are appended.  The row
+-- stores conclusion and its evidence together, so a reader always sees a
+-- conclusion and the supporting samples from the same committed state.
+CREATE TABLE IF NOT EXISTS diagnostic_conclusions (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    sheet_id      INTEGER NOT NULL
+                      REFERENCES diagnostic_sheets(id),
+    conclusion    TEXT NOT NULL
+                      CHECK (conclusion IN ('normal', 'word_order_suspect',
+                                            'stuck_bit', 'inconclusive',
+                                            'unexplainable', 'pending')),
+    detail_json   TEXT,
+    evidence_json TEXT NOT NULL,
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_conclusions_sheet
+    ON diagnostic_conclusions (sheet_id, id);
 """
 
 

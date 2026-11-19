@@ -2,7 +2,7 @@
 {% block content %}
 <section>
   <h2>设备 {{ device_id }} 的测量帧</h2>
-  <p><a href="{{ url_for('main.index') }}">返回首页</a> · <a href="{{ url_for('main.api_device', device_id=device_id) }}">JSON</a></p>
+  <p><a href="{{ url_for('main.index') }}">返回首页</a> · <a href="{{ url_for('main.api_device', device_id=device_id) }}">JSON</a> · <a href="{{ url_for('main.diagnostics') }}">新建该设备诊断单</a></p>
   <table>
     <thead>
       <tr><th>帧号</th><th>固件号</th><th>原始字</th><th>状态</th><th>读数</th>

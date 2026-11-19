@@ -2,6 +2,14 @@
 {% block content %}
 
 <section>
+  <h2>诊断台</h2>
+  <p class="muted">
+    向同一设备、同一固件录入已知 IEEE 754 位型，区分固件字序错误与数据线单位卡死：
+    <a href="{{ url_for('main.diagnostics') }}">进入网页诊断单</a>。
+  </p>
+</section>
+
+<section>
   <h2>上传测量帧 CSV</h2>
   <p class="muted">
     每行 4 列：设备号,帧号,固件号,8 位十六进制原始字（如 <span class="mono">3F800000</span>）。
